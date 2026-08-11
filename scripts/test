@@ -7,6 +7,17 @@ if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
         echo "Linux integration tests require root; sudo is not installed" >&2
         exit 1
     fi
+
+    if command -v rustup >/dev/null 2>&1; then
+        cargo_bin=$(rustup which cargo)
+        rustc_bin=$(rustup which rustc)
+        rustdoc_bin=$(rustup which rustdoc)
+        exec sudo -n env \
+            "RUSTC=$rustc_bin" \
+            "RUSTDOC=$rustdoc_bin" \
+            "$cargo_bin" test "$@"
+    fi
+
     exec sudo -n cargo test "$@"
 fi
 
