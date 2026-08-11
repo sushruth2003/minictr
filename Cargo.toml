@@ -1,0 +1,21 @@
+[package]
+name = "minictr"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+rust.unsafe_code = "warn"
+rust.missing_debug_implementations = "warn"
+rust.unused_must_use = "deny"
+clippy.all = "warn"
+clippy.unwrap_used = "warn"
+clippy.expect_used = "warn"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+nix = { version = "0.31", features = [
+    "sched",
+    "process",
+    "signal",
+    "hostname",
+] }

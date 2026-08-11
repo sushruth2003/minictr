@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Linux integration tests require root; sudo is not installed" >&2
+        exit 1
+    fi
+    exec sudo -n cargo test "$@"
+fi
+
+exec cargo test "$@"
