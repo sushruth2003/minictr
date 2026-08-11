@@ -13,8 +13,7 @@ The overall goal is to build a mini container runtime that covers:
 - Signal handling and forwarding
 - Deterministic process and resource cleanup
 
-This is an educational project, not a production container engine or security
-boundary.
+This is mostly a toy project to see how i can build these things/learn some rust. 
 
 ## Current capabilities
 
