@@ -86,10 +86,13 @@ fn init_container(args: &Cli) -> isize {
     }
 }
 
+#[allow(unsafe_code)]
 fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
     let mut stack = vec![0u8; 1024 * 1024];
     let flags = CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID;
 
+    // SAFETY: the child stack remains alive until the cloned runtime exits,
+    // and the callback only captures data owned by this function.
     let runtime_pid = unsafe {
         clone(
             Box::new(|| init_container(&args)),
@@ -145,6 +148,7 @@ fn main() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
