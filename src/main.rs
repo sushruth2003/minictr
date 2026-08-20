@@ -1,5 +1,6 @@
 use clap::{Parser, error::ErrorKind};
 use nix::{
+    mount::{MsFlags, mount},
     sched::{CloneFlags, clone},
     sys::{
         signal::Signal,
@@ -9,7 +10,8 @@ use nix::{
 };
 use std::{
     ffi::OsString,
-    io,
+    fs, io,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus},
 };
 
@@ -19,8 +21,10 @@ const MAX_HOSTNAME_LEN: usize = 64;
 #[command(author, version, about)]
 struct Cli {
     operation: String,
+    #[arg(long, value_name = "path")]
+    rootfs: PathBuf,
     #[arg(long, value_name = "hostname", value_parser = validate_hostname)]
-    hostname: String,
+    hostname: Option<String>,
     #[arg(num_args = 1.., value_name = "command", allow_hyphen_values = true)]
     command_tokens: Vec<String>,
 }
@@ -62,16 +66,33 @@ where
 }
 
 fn init_container(args: &Cli) -> isize {
-    if let Err(error) = sethostname(&args.hostname).map_err(nix_error_to_io) {
-        eprintln!("failed to set hostname: {error}");
+    if let Err(error) = make_mount_tree_private() {
+        eprintln!("failed to make mount tree private: {error}");
         return 1;
     }
 
-    match gethostname() {
-        Ok(name) => eprintln!("runtime process hostname = {}", name.to_string_lossy()),
-        Err(error) => {
-            eprintln!("failed to read hostname: {error}");
+    if let Err(error) = enter_rootfs(&args.rootfs) {
+        eprintln!("failed to enter rootfs: {error}");
+        return 1;
+    }
+
+    if let Err(error) = mount_procfs() {
+        eprintln!("failed to mount procfs: {error}");
+        return 1;
+    }
+
+    if let Some(hostname) = &args.hostname {
+        if let Err(error) = sethostname(hostname).map_err(nix_error_to_io) {
+            eprintln!("failed to set hostname: {error}");
             return 1;
+        }
+
+        match gethostname() {
+            Ok(name) => eprintln!("runtime process hostname = {}", name.to_string_lossy()),
+            Err(error) => {
+                eprintln!("failed to read hostname: {error}");
+                return 1;
+            }
         }
     }
 
@@ -86,10 +107,55 @@ fn init_container(args: &Cli) -> isize {
     }
 }
 
+fn make_mount_tree_private() -> io::Result<()> {
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        private_mount_flags(),
+        None::<&str>,
+    )
+    .map_err(nix_error_to_io)
+}
+
+fn private_mount_flags() -> MsFlags {
+    MsFlags::MS_PRIVATE | MsFlags::MS_REC
+}
+
+fn enter_rootfs(rootfs: &Path) -> io::Result<()> {
+    nix::unistd::chroot(rootfs).map_err(nix_error_to_io)?;
+    std::env::set_current_dir("/")
+}
+
+fn mount_procfs() -> io::Result<()> {
+    fs::create_dir_all("/proc")?;
+    mount(
+        Some("proc"),
+        "/proc",
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(nix_error_to_io)
+}
+
+fn namespace_clone_flags() -> CloneFlags {
+    CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS
+}
+
 #[allow(unsafe_code)]
 fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
+    let rootfs = fs::canonicalize(&args.rootfs)?;
+    if !rootfs.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("rootfs is not a directory: {}", rootfs.display()),
+        ));
+    }
+    let args = Cli { rootfs, ..args };
+
     let mut stack = vec![0u8; 1024 * 1024];
-    let flags = CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID;
+    let flags = namespace_clone_flags();
 
     // SAFETY: the child stack remains alive until the cloned runtime exits,
     // and the callback only captures data owned by this function.
@@ -157,8 +223,11 @@ mod tests {
         let cli = parse_cli([
             "minictr",
             "run",
+            "--rootfs",
+            "./rootfs",
             "--hostname",
             "testbox",
+            "--",
             "sh",
             "-c",
             "printf hello",
@@ -166,8 +235,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.operation, "run");
-        assert_eq!(cli.hostname, "testbox");
+        assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
+        assert_eq!(cli.hostname.as_deref(), Some("testbox"));
         assert_eq!(cli.command_tokens, ["sh", "-c", "printf hello"]);
+    }
+
+    #[test]
+    fn rootfs_is_parsed_before_the_command_separator() {
+        let cli = parse_cli(["minictr", "run", "--rootfs", "./rootfs", "--", "/bin/sh"]).unwrap();
+
+        assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
+        assert_eq!(cli.hostname, None);
+        assert_eq!(cli.command_tokens, ["/bin/sh"]);
     }
 
     #[test]
@@ -183,10 +262,19 @@ mod tests {
     }
 
     #[test]
-    fn namespace_configuration_includes_pid_and_uts() {
-        let flags = CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID;
+    fn namespace_configuration_includes_pid_uts_and_mount() {
+        let flags = namespace_clone_flags();
 
         assert!(flags.contains(CloneFlags::CLONE_NEWUTS));
         assert!(flags.contains(CloneFlags::CLONE_NEWPID));
+        assert!(flags.contains(CloneFlags::CLONE_NEWNS));
+    }
+
+    #[test]
+    fn mount_tree_is_configured_as_recursively_private() {
+        let flags = private_mount_flags();
+
+        assert!(flags.contains(MsFlags::MS_PRIVATE));
+        assert!(flags.contains(MsFlags::MS_REC));
     }
 }
