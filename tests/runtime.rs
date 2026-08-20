@@ -8,8 +8,13 @@ use std::{
 };
 
 fn run_runtime(args: &[&str]) -> Output {
+    let mut runtime_args = args.to_vec();
+    if runtime_args.first() == Some(&"run") {
+        runtime_args.splice(1..1, ["--rootfs", "/"]);
+    }
+
     Command::new(env!("CARGO_BIN_EXE_minictr"))
-        .args(args)
+        .args(runtime_args)
         .output()
         .expect("runtime should be executable")
 }
@@ -38,6 +43,36 @@ fn unique_temp_path(label: &str) -> std::path::PathBuf {
         "minictr-{label}-{}-{timestamp}",
         std::process::id()
     ))
+}
+
+fn copy_into_rootfs(source: &Path, rootfs: &Path) {
+    let relative = source
+        .strip_prefix("/")
+        .expect("rootfs fixtures must use absolute source paths");
+    let destination = rootfs.join(relative);
+    fs::create_dir_all(
+        destination
+            .parent()
+            .expect("rootfs fixture destination should have a parent"),
+    )
+    .expect("rootfs fixture parent should be created");
+    fs::copy(source, destination).expect("rootfs fixture should be copied");
+}
+
+fn install_binary_with_dependencies(binary: &Path, rootfs: &Path) {
+    copy_into_rootfs(binary, rootfs);
+
+    let output = Command::new("ldd")
+        .arg(binary)
+        .output()
+        .expect("ldd should inspect the rootfs fixture binary");
+    assert!(output.status.success(), "ldd failed: {output:?}");
+
+    for token in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+        if token.starts_with('/') {
+            copy_into_rootfs(Path::new(token), rootfs);
+        }
+    }
 }
 
 #[test]
@@ -156,7 +191,7 @@ fn runtime_init_is_pid_one_and_user_command_is_pid_two() {
         "testbox",
         "/bin/sh",
         "-c",
-        "printf 'command-pid=%s command-ppid=%s\\n' \"$$\" \"$PPID\"; exec awk '/^NSpid:/ { print }' /proc/self/status",
+        "printf 'command-pid=%s command-ppid=%s\\n' \"$$\" \"$PPID\"",
     ]);
 
     assert_success(&output);
@@ -167,7 +202,29 @@ fn runtime_init_is_pid_one_and_user_command_is_pid_two() {
         stdout.contains("command-pid=2 command-ppid=1"),
         "stdout was: {stdout}"
     );
+}
 
+#[test]
+fn procfs_only_exposes_processes_in_the_child_pid_namespace() {
+    let host_test_pid = std::process::id();
+    let command = format!(
+        r#"while IFS= read -r line; do
+    case "$line" in
+        NSpid:*) printf '%s\n' "$line"; break ;;
+    esac
+done < /proc/self/status
+printf 'proc-pids='
+for path in /proc/[0-9]*; do
+    printf '%s,' "$path"
+done
+printf '\n'
+[ ! -e /proc/{host_test_pid} ]"#
+    );
+
+    let output = run_runtime(&["run", "/bin/sh", "-c", &command]);
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let nspid_line = stdout
         .lines()
         .find(|line| line.starts_with("NSpid:"))
@@ -177,39 +234,49 @@ fn runtime_init_is_pid_one_and_user_command_is_pid_two() {
         .skip(1)
         .map(|pid| pid.parse::<u32>().expect("NSpid values should be numeric"))
         .collect::<Vec<_>>();
-    assert!(nspids.len() >= 2, "NSpid line was: {nspid_line}");
+
+    assert_eq!(nspids, [2], "NSpid line was: {nspid_line}");
     assert!(
-        nspids[0] > 1,
-        "host PID should be greater than init: {nspid_line}"
-    );
-    assert_eq!(
-        nspids.last(),
-        Some(&2),
-        "namespace PID should be 2: {nspid_line}"
+        stdout.contains("proc-pids=/proc/1,/proc/2,"),
+        "stdout was: {stdout}"
     );
 }
 
 #[test]
-fn runtime_init_reaps_single_user_child() {
-    let pid_file = unique_temp_path("nspid");
-    let pid_file_string = pid_file.to_string_lossy().into_owned();
-    let command = format!(
-        r#"while IFS= read -r line; do
-    case "$line" in
-        NSpid:*) set -- $line; printf '%s\n' "$2" > "{pid_file_string}"; break ;;
-    esac
-done < /proc/self/status"#
-    );
+fn runtime_waits_for_and_reaps_single_user_child() {
+    let start = Instant::now();
+    let output = run_runtime(&["run", "/bin/sleep", "0.1"]);
 
-    let output = run_runtime(&["run", "--hostname", "testbox", "/bin/sh", "-c", &command]);
     assert_success(&output);
+    assert!(
+        start.elapsed() >= Duration::from_millis(100),
+        "runtime exited before its user child"
+    );
+}
 
-    let host_pid = fs::read_to_string(&pid_file)
-        .expect("user command should record its host PID")
-        .trim()
-        .parse::<u32>()
-        .expect("recorded host PID should be numeric");
-    let _ = fs::remove_file(&pid_file);
+#[test]
+fn child_starts_at_root_and_cannot_see_outside_rootfs() {
+    let fixture = unique_temp_path("rootfs");
+    let rootfs = fixture.join("rootfs");
+    let outside_marker = fixture.join("host-only-marker");
+    fs::create_dir_all(&rootfs).expect("rootfs fixture should be created");
+    fs::write(rootfs.join("inside-marker"), b"inside").expect("inside marker should be created");
+    fs::write(&outside_marker, b"outside").expect("outside marker should be created");
+    install_binary_with_dependencies(Path::new("/bin/sh"), &rootfs);
 
-    assert!(!Path::new(&format!("/proc/{host_pid}")).exists());
+    let command = format!(
+        "pwd; [ -f /inside-marker ] && [ ! -e '{}' ]",
+        outside_marker.display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_minictr"))
+        .args(["run", "--rootfs"])
+        .arg(&rootfs)
+        .args(["--", "/bin/sh", "-c", &command])
+        .output()
+        .expect("runtime should execute against the fixture rootfs");
+
+    fs::remove_dir_all(&fixture).expect("rootfs fixture should be removed");
+
+    assert_success(&output);
+    assert_eq!(output.stdout, b"/\n");
 }

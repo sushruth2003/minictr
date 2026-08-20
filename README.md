@@ -18,7 +18,14 @@ This is mostly a toy project to see how i can build these things/learn some rust
 ## Current capabilities
 
 - Run a command with its arguments and propagate its exit status.
-- Create combined UTS and PID namespaces.
+- Create combined UTS, PID, and mount namespaces.
+- Make the container mount tree recursively private so mount events cannot
+  propagate back to the host.
+- Change the runtime root to `--rootfs` before launching the user command.
+- Start the user command at `/` inside that rootfs instead of inheriting the
+  host working directory.
+- Mount a fresh procfs whose process entries are scoped to the container's PID
+  namespace.
 - Assign an isolated hostname without modifying the host hostname.
 - Start a runtime-owned init process as PID 1 in the new PID namespace.
 - Start the user command as the init process's direct child, normally PID 2.
@@ -33,12 +40,13 @@ process.
 
 ## Usage
 
-Building can happen as a normal user, but creating PID and UTS namespaces
-requires suitable Linux privileges (normally root in the current version).
+Building can happen as a normal user, but creating namespaces and changing the
+process root require suitable Linux privileges (normally root in the current
+version).
 
 ```sh
 cargo build --release
-sudo ./target/release/minictr run --hostname demo /bin/sh -c \
+sudo ./target/release/minictr run --rootfs ./rootfs --hostname demo -- /bin/sh -c \
   'printf "pid=%s parent=%s hostname=%s\n" "$$" "$PPID" "$(hostname)"'
 ```
 
@@ -58,7 +66,8 @@ single-child reaping, and cleanup.
 
 1. Complete runtime-owned init behavior for multiple descendants and orphan
    reaping.
-2. Add mount namespaces and an isolated root filesystem.
+2. Replace the initial `chroot` boundary with bind-mounted `pivot_root`
+   lifecycle management.
 3. Add cgroup-based resource controls.
 4. Add signal forwarding and shutdown semantics.
 5. Harden cleanup across normal exits and failures.
