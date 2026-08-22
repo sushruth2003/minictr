@@ -1,21 +1,23 @@
 use clap::{Parser, error::ErrorKind};
 use nix::{
-    mount::{MsFlags, mount},
+    mount::{MntFlags, MsFlags, mount, umount2},
     sched::{CloneFlags, clone},
     sys::{
         signal::Signal,
         wait::{WaitStatus, waitpid},
     },
-    unistd::{gethostname, sethostname},
+    unistd::{gethostname, pivot_root, sethostname},
 };
 use std::{
     ffi::OsString,
     fs, io,
-    path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    os::unix::process::CommandExt,
+    path::{Component, Path, PathBuf},
+    process::Command,
 };
 
 const MAX_HOSTNAME_LEN: usize = 64;
+const OLD_ROOT_PATH: &str = "/oldroot";
 
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(author, version, about)]
@@ -25,8 +27,53 @@ struct Cli {
     rootfs: PathBuf,
     #[arg(long, value_name = "hostname", value_parser = validate_hostname)]
     hostname: Option<String>,
+    #[arg(
+        long = "mount",
+        value_name = "host_path:container_path",
+        value_parser = parse_bind_mount
+    )]
+    bind_mounts: Vec<BindMount>,
     #[arg(num_args = 1.., value_name = "command", allow_hyphen_values = true)]
     command_tokens: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BindMount {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+fn parse_bind_mount(value: &str) -> Result<BindMount, String> {
+    let (source, destination) = value
+        .rsplit_once(':')
+        .ok_or_else(|| "mount must use host_path:container_path syntax".to_owned())?;
+    if source.is_empty() {
+        return Err("mount host path must not be empty".to_owned());
+    }
+
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute() {
+        return Err("mount container path must be absolute".to_owned());
+    }
+    if destination
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err("mount container path must not contain '..'".to_owned());
+    }
+    if destination == Path::new("/") {
+        return Err("mount container path must not replace the container root".to_owned());
+    }
+    if destination.starts_with(OLD_ROOT_PATH) {
+        return Err(format!(
+            "mount container path must not use reserved path {OLD_ROOT_PATH}"
+        ));
+    }
+
+    Ok(BindMount {
+        source: PathBuf::from(source),
+        destination,
+    })
 }
 
 fn validate_hostname(value: &str) -> Result<String, String> {
@@ -71,8 +118,24 @@ fn init_container(args: &Cli) -> isize {
         return 1;
     }
 
-    if let Err(error) = enter_rootfs(&args.rootfs) {
-        eprintln!("failed to enter rootfs: {error}");
+    if let Err(error) = make_rootfs_mount_point(&args.rootfs) {
+        eprintln!("failed to make rootfs a mount point: {error}");
+        return 1;
+    }
+
+    for bind_mount in &args.bind_mounts {
+        if let Err(error) = mount_bind(&args.rootfs, bind_mount) {
+            eprintln!(
+                "failed to bind mount {} at {}: {error}",
+                bind_mount.source.display(),
+                bind_mount.destination.display()
+            );
+            return 1;
+        }
+    }
+
+    if let Err(error) = pivot_into_rootfs(&args.rootfs) {
+        eprintln!("failed to pivot into rootfs: {error}");
         return 1;
     }
 
@@ -97,14 +160,9 @@ fn init_container(args: &Cli) -> isize {
     }
 
     eprintln!("inside child: {}", std::process::id());
-
-    match run_command(&args.command_tokens) {
-        Ok(status) => status.code().unwrap_or(1) as isize,
-        Err(error) => {
-            eprintln!("failed to execute command: {error}");
-            1
-        }
-    }
+    let error = exec_command(&args.command_tokens);
+    eprintln!("failed to execute command: {error}");
+    1
 }
 
 fn make_mount_tree_private() -> io::Result<()> {
@@ -122,9 +180,120 @@ fn private_mount_flags() -> MsFlags {
     MsFlags::MS_PRIVATE | MsFlags::MS_REC
 }
 
-fn enter_rootfs(rootfs: &Path) -> io::Result<()> {
-    nix::unistd::chroot(rootfs).map_err(nix_error_to_io)?;
-    std::env::set_current_dir("/")
+fn make_rootfs_mount_point(rootfs: &Path) -> io::Result<()> {
+    mount(
+        Some(rootfs),
+        rootfs,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(nix_error_to_io)
+}
+
+fn mount_bind(rootfs: &Path, bind_mount: &BindMount) -> io::Result<()> {
+    let target = prepare_bind_target(rootfs, bind_mount)?;
+    let mut flags = MsFlags::MS_BIND;
+    if bind_mount.source.is_dir() {
+        flags |= MsFlags::MS_REC;
+    }
+
+    mount(
+        Some(bind_mount.source.as_path()),
+        target.as_path(),
+        None::<&str>,
+        flags,
+        None::<&str>,
+    )
+    .map_err(nix_error_to_io)
+}
+
+fn prepare_bind_target(rootfs: &Path, bind_mount: &BindMount) -> io::Result<PathBuf> {
+    let relative_destination = bind_mount
+        .destination
+        .strip_prefix("/")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount target is not absolute"))?;
+    let target = rootfs.join(relative_destination);
+    ensure_existing_ancestor_is_in_rootfs(rootfs, &target)?;
+
+    if bind_mount.source.is_dir() {
+        fs::create_dir_all(&target)?;
+    } else {
+        let parent = target.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "mount target has no parent")
+        })?;
+        fs::create_dir_all(parent)?;
+        if !target.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+        }
+    }
+
+    ensure_existing_ancestor_is_in_rootfs(rootfs, &target)?;
+    Ok(target)
+}
+
+fn ensure_existing_ancestor_is_in_rootfs(rootfs: &Path, target: &Path) -> io::Result<()> {
+    let mut existing = target;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mount target has no existing ancestor",
+            )
+        })?;
+    }
+
+    let resolved = fs::canonicalize(existing)?;
+    if !resolved.starts_with(rootfs) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "mount target resolves outside rootfs through {}",
+                existing.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn pivot_into_rootfs(rootfs: &Path) -> io::Result<()> {
+    let put_old = rootfs.join(OLD_ROOT_PATH.trim_start_matches('/'));
+    prepare_old_root_directory(&put_old)?;
+
+    std::env::set_current_dir(rootfs)?;
+    pivot_root(Path::new("."), Path::new("oldroot")).map_err(nix_error_to_io)?;
+    std::env::set_current_dir("/")?;
+    umount2(OLD_ROOT_PATH, MntFlags::MNT_DETACH).map_err(nix_error_to_io)?;
+    fs::remove_dir(OLD_ROOT_PATH)
+}
+
+fn prepare_old_root_directory(put_old: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(put_old) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if fs::read_dir(put_old)?.next().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "reserved old-root directory is not empty: {}",
+                        put_old.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "reserved old-root path is not a directory: {}",
+                put_old.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(put_old),
+        Err(error) => Err(error),
+    }
 }
 
 fn mount_procfs() -> io::Result<()> {
@@ -152,7 +321,19 @@ fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
             format!("rootfs is not a directory: {}", rootfs.display()),
         ));
     }
-    let args = Cli { rootfs, ..args };
+    let mut args = args;
+    args.rootfs = rootfs;
+    for bind_mount in &mut args.bind_mounts {
+        bind_mount.source = fs::canonicalize(&bind_mount.source).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to resolve bind mount source {}: {error}",
+                    bind_mount.source.display()
+                ),
+            )
+        })?;
+    }
 
     let mut stack = vec![0u8; 1024 * 1024];
     let flags = namespace_clone_flags();
@@ -187,13 +368,11 @@ fn nix_error_to_io(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
-fn run_command(command_tokens: &[String]) -> io::Result<ExitStatus> {
+fn exec_command(command_tokens: &[String]) -> io::Error {
     let command = &command_tokens[0];
     let mut command_builder = Command::new(command);
     command_builder.args(&command_tokens[1..]);
-    let mut child_process = command_builder.spawn()?;
-    eprintln!("child pid = {}", child_process.id());
-    child_process.wait()
+    command_builder.exec()
 }
 
 fn main() {
@@ -227,6 +406,8 @@ mod tests {
             "./rootfs",
             "--hostname",
             "testbox",
+            "--mount",
+            "/host/data:/data",
             "--",
             "sh",
             "-c",
@@ -237,6 +418,13 @@ mod tests {
         assert_eq!(cli.operation, "run");
         assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(cli.hostname.as_deref(), Some("testbox"));
+        assert_eq!(
+            cli.bind_mounts,
+            [BindMount {
+                source: PathBuf::from("/host/data"),
+                destination: PathBuf::from("/data"),
+            }]
+        );
         assert_eq!(cli.command_tokens, ["sh", "-c", "printf hello"]);
     }
 
@@ -246,7 +434,27 @@ mod tests {
 
         assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(cli.hostname, None);
+        assert!(cli.bind_mounts.is_empty());
         assert_eq!(cli.command_tokens, ["/bin/sh"]);
+    }
+
+    #[test]
+    fn bind_mount_parser_requires_an_absolute_container_path() {
+        assert_eq!(
+            parse_bind_mount("/host/data:/data").unwrap(),
+            BindMount {
+                source: PathBuf::from("/host/data"),
+                destination: PathBuf::from("/data"),
+            }
+        );
+        assert!(parse_bind_mount("/host/data:data").is_err());
+        assert!(parse_bind_mount("/host/data").is_err());
+        assert!(parse_bind_mount(":/data").is_err());
+        assert!(parse_bind_mount("/host/data:/../outside").is_err());
+        assert!(parse_bind_mount("/host/data:/").is_err());
+        assert!(parse_bind_mount("/host/data:/oldroot").is_err());
+        assert!(parse_bind_mount("/host/data:/oldroot/nested").is_err());
+        assert!(parse_bind_mount("/host/data:/oldroot-safe").is_ok());
     }
 
     #[test]

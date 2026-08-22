@@ -21,22 +21,24 @@ This is mostly a toy project to see how i can build these things/learn some rust
 - Create combined UTS, PID, and mount namespaces.
 - Make the container mount tree recursively private so mount events cannot
   propagate back to the host.
-- Change the runtime root to `--rootfs` before launching the user command.
+- Bind-mount `--rootfs` onto itself, pivot it into `/`, then detach and remove
+  `/oldroot` so the previous host root is not pathname-accessible.
 - Start the user command at `/` inside that rootfs instead of inheriting the
   host working directory.
 - Mount a fresh procfs whose process entries are scoped to the container's PID
   namespace.
+- Bind-mount host files or directories into the container with repeatable
+  `--mount host_path:container_path` options.
 - Assign an isolated hostname without modifying the host hostname.
-- Start a runtime-owned init process as PID 1 in the new PID namespace.
-- Start the user command as the init process's direct child, normally PID 2.
-- Wait for and reap the direct user process.
+- Replace the namespace setup process with the user command so it runs as PID 1.
+- Wait for the container's PID 1 process and propagate its exit status.
 - Demonstrate host and namespace PID mapping through `/proc/<pid>/status` and
   `NSpid`.
-- Verify that the direct user process is gone after the runtime exits.
+- Verify that the container's PID 1 process is gone after the runtime exits.
 
-Reaping multiple descendants and orphaned process trees is intentionally left
-for a follow-up milestone. The current lifecycle model supports one direct user
-process.
+The user command currently owns Linux PID 1 responsibilities, including
+handling signals and reaping any descendants it creates. An optional init shim
+is intentionally left for a follow-up milestone.
 
 ## Usage
 
@@ -50,6 +52,17 @@ sudo ./target/release/minictr run --rootfs ./rootfs --hostname demo -- /bin/sh -
   'printf "pid=%s parent=%s hostname=%s\n" "$$" "$PPID" "$(hostname)"'
 ```
 
+Bind-mount a host directory at an absolute path inside the container:
+
+```sh
+sudo ./target/release/minictr run --rootfs ./rootfs \
+  --mount /host/data:/data -- /bin/sh
+```
+
+Pass `--mount` more than once to add multiple bind mounts. Missing destination
+directories or files are created inside the rootfs before mounting. `/` and
+the runtime-reserved `/oldroot` tree cannot be used as mount destinations.
+
 ## Tests
 
 The integration tests exercise Linux namespace behavior and require root:
@@ -59,15 +72,15 @@ The integration tests exercise Linux namespace behavior and require root:
 ```
 
 The suite covers command execution, argument and stream preservation, exit
-status propagation, UTS isolation, PID 1/PID 2 ownership, `NSpid` mapping,
-single-child reaping, and cleanup.
+status propagation, UTS isolation, user-command PID 1 ownership, `NSpid`
+mapping, root-pivot isolation, rootfs `/tmp` isolation, bind mounts, and cleanup.
+It also includes a combined M3 acceptance test for PID, hostname, rootfs,
+procfs, temporary-file, and bind-mount behavior.
 
 ## Roadmap
 
-1. Complete runtime-owned init behavior for multiple descendants and orphan
+1. Add an optional init shim for workloads that need descendant and orphan
    reaping.
-2. Replace the initial `chroot` boundary with bind-mounted `pivot_root`
-   lifecycle management.
-3. Add cgroup-based resource controls.
-4. Add signal forwarding and shutdown semantics.
-5. Harden cleanup across normal exits and failures.
+2. Add cgroup-based resource controls.
+3. Add signal forwarding and shutdown semantics.
+4. Harden cleanup across normal exits and failures.
