@@ -30,15 +30,20 @@ This is mostly a toy project to see how i can build these things/learn some rust
 - Bind-mount host files or directories into the container with repeatable
   `--mount host_path:container_path` options.
 - Assign an isolated hostname without modifying the host hostname.
-- Replace the namespace setup process with the user command so it runs as PID 1.
+- By default, replace the namespace setup process with the user command so it
+  runs as PID 1.
+- Optionally keep a minimal init shim as PID 1 with `--init`, run the user
+  command as its child, reap adopted descendants, and preserve the user
+  command's exit status.
 - Wait for the container's PID 1 process and propagate its exit status.
 - Demonstrate host and namespace PID mapping through `/proc/<pid>/status` and
   `NSpid`.
 - Verify that the container's PID 1 process is gone after the runtime exits.
 
-The user command currently owns Linux PID 1 responsibilities, including
-handling signals and reaping any descendants it creates. An optional init shim
-is intentionally left for a follow-up milestone.
+Without `--init`, the user command owns Linux PID 1 responsibilities, including
+handling signals and reaping any descendants it creates. With `--init`, the
+shim waits until the workload and all adopted descendants have exited, so a
+long-running descendant intentionally keeps the container alive.
 
 ## Usage
 
@@ -63,6 +68,17 @@ Pass `--mount` more than once to add multiple bind mounts. Missing destination
 directories or files are created inside the rootfs before mounting. `/` and
 the runtime-reserved `/oldroot` tree cannot be used as mount destinations.
 
+Run the workload under the optional init shim when it may orphan descendants:
+
+```sh
+sudo ./target/release/minictr run --rootfs ./rootfs --init -- /bin/sh -c \
+  'sleep 1 & exit 0'
+```
+
+The shim reaps the background process and returns the shell's exit status after
+all descendants have exited. Signal forwarding is planned for a later
+milestone.
+
 ## Tests
 
 The integration tests exercise Linux namespace behavior and require root:
@@ -72,15 +88,14 @@ The integration tests exercise Linux namespace behavior and require root:
 ```
 
 The suite covers command execution, argument and stream preservation, exit
-status propagation, UTS isolation, user-command PID 1 ownership, `NSpid`
-mapping, root-pivot isolation, rootfs `/tmp` isolation, bind mounts, and cleanup.
-It also includes a combined M3 acceptance test for PID, hostname, rootfs,
-procfs, temporary-file, and bind-mount behavior.
+status propagation, UTS isolation, user-command PID 1 ownership, optional init
+topology and orphan reaping, `NSpid` mapping, root-pivot isolation, rootfs
+`/tmp` isolation, bind mounts, and cleanup. It also includes a combined M3
+acceptance test for PID, hostname, rootfs, procfs, temporary-file, and
+bind-mount behavior.
 
 ## Roadmap
 
-1. Add an optional init shim for workloads that need descendant and orphan
-   reaping.
-2. Add cgroup-based resource controls.
-3. Add signal forwarding and shutdown semantics.
-4. Harden cleanup across normal exits and failures.
+1. Add cgroup-based resource controls.
+2. Add signal forwarding and shutdown semantics.
+3. Harden cleanup across normal exits and failures.

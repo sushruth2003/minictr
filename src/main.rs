@@ -1,12 +1,14 @@
 use clap::{Parser, error::ErrorKind};
 use nix::{
+    errno::Errno,
+    libc,
     mount::{MntFlags, MsFlags, mount, umount2},
     sched::{CloneFlags, clone},
     sys::{
         signal::Signal,
         wait::{WaitStatus, waitpid},
     },
-    unistd::{gethostname, pivot_root, sethostname},
+    unistd::{ForkResult, Pid, fork, gethostname, pivot_root, sethostname},
 };
 use std::{
     ffi::OsString,
@@ -33,6 +35,8 @@ struct Cli {
         value_parser = parse_bind_mount
     )]
     bind_mounts: Vec<BindMount>,
+    #[arg(long)]
+    init: bool,
     #[arg(num_args = 1.., value_name = "command", allow_hyphen_values = true)]
     command_tokens: Vec<String>,
 }
@@ -113,56 +117,97 @@ where
 }
 
 fn init_container(args: &Cli) -> isize {
+    match run_container(args) {
+        Ok(code) => code as isize,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+fn run_container(args: &Cli) -> Result<i32, String> {
     if let Err(error) = make_mount_tree_private() {
-        eprintln!("failed to make mount tree private: {error}");
-        return 1;
+        return Err(format!("failed to make mount tree private: {error}"));
     }
 
     if let Err(error) = make_rootfs_mount_point(&args.rootfs) {
-        eprintln!("failed to make rootfs a mount point: {error}");
-        return 1;
+        return Err(format!("failed to make rootfs a mount point: {error}"));
     }
 
     for bind_mount in &args.bind_mounts {
         if let Err(error) = mount_bind(&args.rootfs, bind_mount) {
-            eprintln!(
+            return Err(format!(
                 "failed to bind mount {} at {}: {error}",
                 bind_mount.source.display(),
                 bind_mount.destination.display()
-            );
-            return 1;
+            ));
         }
     }
 
     if let Err(error) = pivot_into_rootfs(&args.rootfs) {
-        eprintln!("failed to pivot into rootfs: {error}");
-        return 1;
+        return Err(format!("failed to pivot into rootfs: {error}"));
     }
 
     if let Err(error) = mount_procfs() {
-        eprintln!("failed to mount procfs: {error}");
-        return 1;
+        return Err(format!("failed to mount procfs: {error}"));
     }
 
     if let Some(hostname) = &args.hostname {
         if let Err(error) = sethostname(hostname).map_err(nix_error_to_io) {
-            eprintln!("failed to set hostname: {error}");
-            return 1;
+            return Err(format!("failed to set hostname: {error}"));
         }
 
         match gethostname() {
             Ok(name) => eprintln!("runtime process hostname = {}", name.to_string_lossy()),
             Err(error) => {
-                eprintln!("failed to read hostname: {error}");
-                return 1;
+                return Err(format!("failed to read hostname: {error}"));
             }
         }
     }
 
-    eprintln!("inside child: {}", std::process::id());
-    let error = exec_command(&args.command_tokens);
-    eprintln!("failed to execute command: {error}");
-    1
+    if args.init {
+        let workload_pid = match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                eprintln!("inside child: {}", std::process::id());
+                let error = exec_command(&args.command_tokens);
+                eprintln!("failed to execute command: {error}");
+                // SAFETY: exec failed in the post-fork child, so terminate
+                // immediately without running cleanup inherited from PID 1.
+                unsafe { libc::_exit(127) };
+            }
+            Ok(ForkResult::Parent { child }) => child,
+            Err(error) => {
+                return Err(format!("failed to fork workload: {error}"));
+            }
+        };
+        let mut workload_status = None;
+
+        Ok(loop {
+            match waitpid(Pid::from_raw(-1), None) {
+                Ok(WaitStatus::Exited(pid, code)) if pid == workload_pid => {
+                    workload_status = Some(code);
+                }
+                Ok(WaitStatus::Signaled(pid, signal, _)) if pid == workload_pid => {
+                    workload_status = Some(128 + signal as i32);
+                }
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(Errno::ECHILD) => break workload_status.unwrap_or(1),
+                Err(error) => {
+                    eprintln!("failed to wait for workload: {error}");
+                    break 1;
+                }
+            }
+        })
+    } else {
+        eprintln!("inside child: {}", std::process::id());
+        Err(format!(
+            "failed to execute command: {}",
+            exec_command(&args.command_tokens)
+        ))
+    }
 }
 
 fn make_mount_tree_private() -> io::Result<()> {
@@ -406,6 +451,7 @@ mod tests {
             "./rootfs",
             "--hostname",
             "testbox",
+            "--init",
             "--mount",
             "/host/data:/data",
             "--",
@@ -418,6 +464,7 @@ mod tests {
         assert_eq!(cli.operation, "run");
         assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(cli.hostname.as_deref(), Some("testbox"));
+        assert!(cli.init);
         assert_eq!(
             cli.bind_mounts,
             [BindMount {
@@ -434,6 +481,7 @@ mod tests {
 
         assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(cli.hostname, None);
+        assert!(!cli.init);
         assert!(cli.bind_mounts.is_empty());
         assert_eq!(cli.command_tokens, ["/bin/sh"]);
     }
