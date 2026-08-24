@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -220,6 +221,103 @@ fn user_command_executes_as_pid_one() {
         stdout.contains("command-pid=1 command-ppid=0"),
         "stdout was: {stdout}"
     );
+}
+
+#[test]
+fn init_flag_runs_user_command_as_child_of_container_init() {
+    let output = run_runtime(&[
+        "run",
+        "--init",
+        "/bin/sh",
+        "-c",
+        "printf 'command-pid=%s command-ppid=%s\\n' \"$$\" \"$PPID\"",
+    ]);
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "command-pid=2 command-ppid=1\n"
+    );
+}
+
+#[test]
+fn init_flag_preserves_workload_exit_status() {
+    let output = run_runtime(&["run", "--init", "/bin/sh", "-c", "sleep 1 & exit 37"]);
+
+    assert_eq!(output.status.code(), Some(37));
+}
+
+#[test]
+fn init_exec_failure_returns_command_not_found_status() {
+    let output = run_runtime(&["run", "--init", "/definitely/not/a/minictr-test-executable"]);
+
+    assert_eq!(output.status.code(), Some(127));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to execute command"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn init_reaps_orphan_without_leaving_zombie() {
+    let (fixture, rootfs) = create_basic_rootfs("init-reaping");
+    let control = fixture.join("control");
+    fs::create_dir_all(&control).expect("control directory should be created");
+    fs::create_dir_all(rootfs.join("dev")).expect("rootfs dev directory should be created");
+    fs::write(rootfs.join("dev/null"), b"").expect("rootfs null device placeholder should exist");
+
+    let command = r#"
+( trap '' HUP
+  while [ ! -s /control/orphan.pid ]; do
+    sleep 0.01
+  done
+  read orphan_pid < /control/orphan.pid
+  sleep 0.5
+  state=gone
+  if [ -e "/proc/$orphan_pid/status" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        State:*) state="$line"; break ;;
+      esac
+    done < "/proc/$orphan_pid/status"
+  fi
+  printf '%s\n' "$state" > /control/orphan.state
+) &
+
+( trap '' HUP
+  ( trap '' HUP; sleep 0.2 ) &
+  printf '%s\n' "$!" > /control/orphan.pid
+) &
+orphan_parent_pid=$!
+wait "$orphan_parent_pid"
+exit 37
+"#;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_minictr"))
+        .args(["run", "--rootfs"])
+        .arg(&rootfs)
+        .args(["--init", "--mount"])
+        .arg(format!("{}:/control", control.display()))
+        .args(["/bin/sh", "-c", command])
+        .spawn()
+        .expect("runtime should start for init reaping test");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let state_path = control.join("orphan.state");
+    while !state_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("runtime should finish init reaping test");
+    let state = fs::read_to_string(&state_path).expect("checker should report orphan state");
+
+    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(state.trim(), "gone", "orphan state was: {state}");
+
+    fs::remove_dir_all(fixture).expect("init reaping fixture should be removed");
 }
 
 #[test]
