@@ -1,124 +1,33 @@
-use clap::{Parser, error::ErrorKind};
+mod cgroup;
+mod cli;
+mod config;
+mod rootfs;
+
+use crate::{
+    cgroup::Cgroup,
+    cli::{Cli, parse_cli},
+    config::RuntimeConfig,
+    rootfs::{
+        make_mount_tree_private, make_rootfs_mount_point, mount_bind, mount_procfs,
+        pivot_into_rootfs,
+    },
+};
 use nix::{
     errno::Errno,
     libc,
-    mount::{MntFlags, MsFlags, mount, umount2},
     sched::{CloneFlags, clone},
     sys::{
         signal::Signal,
         wait::{WaitStatus, waitpid},
     },
-    unistd::{ForkResult, Pid, fork, gethostname, pivot_root, sethostname},
+    unistd::{ForkResult, Pid, fork, gethostname, sethostname},
 };
-use std::{
-    ffi::OsString,
-    fs, io,
-    os::unix::process::CommandExt,
-    path::{Component, Path, PathBuf},
-    process::Command,
-};
+use std::{fs, io, os::unix::process::CommandExt, process::Command};
 
-const MAX_HOSTNAME_LEN: usize = 64;
-const OLD_ROOT_PATH: &str = "/oldroot";
-const DEFAULT_PIDS_MAX: &str = "16";
-
-#[derive(Parser, Debug, PartialEq, Eq)]
-#[command(author, version, about)]
-struct Cli {
-    operation: String,
-    #[arg(long, value_name = "path")]
-    rootfs: PathBuf,
-    #[arg(long, value_name = "hostname", value_parser = validate_hostname)]
-    hostname: Option<String>,
-    #[arg(
-        long = "mount",
-        value_name = "host_path:container_path",
-        value_parser = parse_bind_mount
-    )]
-    bind_mounts: Vec<BindMount>,
-    #[arg(long)]
-    init: bool,
-    #[arg(num_args = 1.., value_name = "command", allow_hyphen_values = true)]
-    command_tokens: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct BindMount {
-    source: PathBuf,
-    destination: PathBuf,
-}
-
-fn parse_bind_mount(value: &str) -> Result<BindMount, String> {
-    let (source, destination) = value
-        .rsplit_once(':')
-        .ok_or_else(|| "mount must use host_path:container_path syntax".to_owned())?;
-    if source.is_empty() {
-        return Err("mount host path must not be empty".to_owned());
-    }
-
-    let destination = PathBuf::from(destination);
-    if !destination.is_absolute() {
-        return Err("mount container path must be absolute".to_owned());
-    }
-    if destination
-        .components()
-        .any(|component| component == Component::ParentDir)
+fn init_container(args: &Cli, cgroup: Option<&Cgroup>) -> isize {
+    if let Some(cgroup) = cgroup
+        && let Err(error) = cgroup.join_current()
     {
-        return Err("mount container path must not contain '..'".to_owned());
-    }
-    if destination == Path::new("/") {
-        return Err("mount container path must not replace the container root".to_owned());
-    }
-    if destination.starts_with(OLD_ROOT_PATH) {
-        return Err(format!(
-            "mount container path must not use reserved path {OLD_ROOT_PATH}"
-        ));
-    }
-
-    Ok(BindMount {
-        source: PathBuf::from(source),
-        destination,
-    })
-}
-
-fn validate_hostname(value: &str) -> Result<String, String> {
-    if value.is_empty() {
-        return Err("hostname must not be empty".to_owned());
-    }
-    if value.len() > MAX_HOSTNAME_LEN {
-        return Err(format!("hostname must be at most {MAX_HOSTNAME_LEN} bytes"));
-    }
-    if value
-        .bytes()
-        .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.'))
-    {
-        return Err("hostname may contain only letters, digits, '-' and '.'".to_owned());
-    }
-    for label in value.split('.') {
-        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
-            return Err("hostname labels must not be empty or start/end with '-'".to_owned());
-        }
-    }
-    Ok(value.to_owned())
-}
-
-fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    let cli = Cli::try_parse_from(args)?;
-    if cli.operation != "run" {
-        return Err(clap::Error::raw(
-            ErrorKind::ValueValidation,
-            "only supported operation is run",
-        ));
-    }
-    Ok(cli)
-}
-
-fn init_container(args: &Cli, cgroup_path: &Path) -> isize {
-    if let Err(error) = join_cgroup(cgroup_path) {
         eprintln!("failed to join cgroup: {error}");
         return 1;
     }
@@ -216,224 +125,13 @@ fn run_container(args: &Cli) -> Result<i32, String> {
     }
 }
 
-fn make_mount_tree_private() -> io::Result<()> {
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        private_mount_flags(),
-        None::<&str>,
-    )
-    .map_err(nix_error_to_io)
-}
-
-fn private_mount_flags() -> MsFlags {
-    MsFlags::MS_PRIVATE | MsFlags::MS_REC
-}
-
-fn make_rootfs_mount_point(rootfs: &Path) -> io::Result<()> {
-    mount(
-        Some(rootfs),
-        rootfs,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(nix_error_to_io)
-}
-
-fn mount_bind(rootfs: &Path, bind_mount: &BindMount) -> io::Result<()> {
-    let target = prepare_bind_target(rootfs, bind_mount)?;
-    let mut flags = MsFlags::MS_BIND;
-    if bind_mount.source.is_dir() {
-        flags |= MsFlags::MS_REC;
-    }
-
-    mount(
-        Some(bind_mount.source.as_path()),
-        target.as_path(),
-        None::<&str>,
-        flags,
-        None::<&str>,
-    )
-    .map_err(nix_error_to_io)
-}
-
-fn prepare_bind_target(rootfs: &Path, bind_mount: &BindMount) -> io::Result<PathBuf> {
-    let relative_destination = bind_mount
-        .destination
-        .strip_prefix("/")
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mount target is not absolute"))?;
-    let target = rootfs.join(relative_destination);
-    ensure_existing_ancestor_is_in_rootfs(rootfs, &target)?;
-
-    if bind_mount.source.is_dir() {
-        fs::create_dir_all(&target)?;
-    } else {
-        let parent = target.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "mount target has no parent")
-        })?;
-        fs::create_dir_all(parent)?;
-        if !target.exists() {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)?;
-        }
-    }
-
-    ensure_existing_ancestor_is_in_rootfs(rootfs, &target)?;
-    Ok(target)
-}
-
-fn ensure_existing_ancestor_is_in_rootfs(rootfs: &Path, target: &Path) -> io::Result<()> {
-    let mut existing = target;
-    while !existing.exists() {
-        existing = existing.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mount target has no existing ancestor",
-            )
-        })?;
-    }
-
-    let resolved = fs::canonicalize(existing)?;
-    if !resolved.starts_with(rootfs) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "mount target resolves outside rootfs through {}",
-                existing.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn pivot_into_rootfs(rootfs: &Path) -> io::Result<()> {
-    let put_old = rootfs.join(OLD_ROOT_PATH.trim_start_matches('/'));
-    prepare_old_root_directory(&put_old)?;
-
-    std::env::set_current_dir(rootfs)?;
-    pivot_root(Path::new("."), Path::new("oldroot")).map_err(nix_error_to_io)?;
-    std::env::set_current_dir("/")?;
-    umount2(OLD_ROOT_PATH, MntFlags::MNT_DETACH).map_err(nix_error_to_io)?;
-    fs::remove_dir(OLD_ROOT_PATH)
-}
-
-fn prepare_old_root_directory(put_old: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(put_old) {
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            if fs::read_dir(put_old)?.next().is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "reserved old-root directory is not empty: {}",
-                        put_old.display()
-                    ),
-                ));
-            }
-            Ok(())
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "reserved old-root path is not a directory: {}",
-                put_old.display()
-            ),
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(put_old),
-        Err(error) => Err(error),
-    }
-}
-
-fn mount_procfs() -> io::Result<()> {
-    fs::create_dir_all("/proc")?;
-    mount(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
-    )
-    .map_err(nix_error_to_io)
-}
-
 fn namespace_clone_flags() -> CloneFlags {
     CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS
 }
 
-#[cfg(target_os = "linux")]
-fn create_cgroup() -> io::Result<PathBuf> {
-    let root = Path::new("/sys/fs/cgroup");
-    let controllers = fs::read_to_string(root.join("cgroup.controllers"))?;
-    if !controllers
-        .split_whitespace()
-        .any(|controller| controller == "pids")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cgroup v2 pids controller is not available",
-        ));
-    }
-
-    let root_subtree_control = root.join("cgroup.subtree_control");
-    let enabled = fs::read_to_string(&root_subtree_control)?;
-    if !enabled
-        .split_whitespace()
-        .any(|controller| controller == "pids")
-    {
-        fs::write(&root_subtree_control, "+pids")?;
-    }
-
-    let parent = root.join("minictr");
-    fs::create_dir_all(&parent)?;
-    let subtree_control = parent.join("cgroup.subtree_control");
-    if subtree_control.exists() {
-        let enabled = fs::read_to_string(&subtree_control)?;
-        if !enabled
-            .split_whitespace()
-            .any(|controller| controller == "pids")
-        {
-            fs::write(&subtree_control, "+pids")?;
-        }
-    }
-    let path = parent.join(format!("runtime-{}", std::process::id()));
-    fs::create_dir(&path)?;
-    if let Err(error) = fs::write(path.join("pids.max"), DEFAULT_PIDS_MAX) {
-        let _ = fs::remove_dir(&path);
-        return Err(error);
-    }
-    Ok(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn create_cgroup() -> io::Result<PathBuf> {
-    Ok(PathBuf::new())
-}
-
-#[cfg(target_os = "linux")]
-fn join_cgroup(path: &Path) -> io::Result<()> {
-    fs::write(path.join("cgroup.procs"), std::process::id().to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn join_cgroup(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn remove_cgroup(path: &Path) -> io::Result<()> {
-    fs::remove_dir(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn remove_cgroup(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[allow(unsafe_code)]
 fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
+    let runtime_config = RuntimeConfig::load(args.config.as_deref())?;
     let rootfs = fs::canonicalize(&args.rootfs)?;
     if !rootfs.is_dir() {
         return Err(io::Error::new(
@@ -457,41 +155,60 @@ fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
 
     let mut stack = vec![0u8; 1024 * 1024];
     let flags = namespace_clone_flags();
-    let cgroup_path = create_cgroup()?;
+    let cgroup = Cgroup::create(&runtime_config.resources)?;
 
     // SAFETY: the child stack remains alive until the cloned runtime exits,
     // and the callback only captures data owned by this function.
     let runtime_pid = unsafe {
         clone(
-            Box::new(|| init_container(&args, &cgroup_path)),
+            Box::new(|| init_container(&args, cgroup.as_ref())),
             &mut stack,
             flags,
             Some(Signal::SIGCHLD as i32),
         )
     };
-    let runtime_result = match runtime_pid {
-        Ok(runtime_pid) => match waitpid(runtime_pid, None) {
-            Ok(status) => match status {
-                WaitStatus::Exited(_, code) => Ok(code),
-                WaitStatus::Signaled(_, signal, _) => {
-                    // PID 1 was killed by a signal
-                    Ok(128 + signal as i32)
-                }
+    let runtime_result = runtime_pid
+        .map_err(io::Error::from)
+        .and_then(wait_for_runtime);
 
-                other => {
-                    // Unexpected for a blocking waitpid with no special flags
-                    Err(io::Error::other(format!(
-                        "unexpected wait status: {other:?}"
-                    )))
-                }
-            },
-            Err(error) => Err(io::Error::from(error)),
-        },
-        Err(error) => Err(io::Error::from(error)),
+    let cleanup_result = match cgroup {
+        Some(cgroup) => cgroup.remove(),
+        None => Ok(()),
     };
+    resolve_runtime_and_cleanup(runtime_result, cleanup_result)
+}
 
-    remove_cgroup(&cgroup_path)?;
-    runtime_result
+fn wait_for_runtime(runtime_pid: Pid) -> io::Result<i32> {
+    loop {
+        match waitpid(runtime_pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
+            Ok(other) => {
+                return Err(io::Error::other(format!(
+                    "unexpected wait status: {other:?}"
+                )));
+            }
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+}
+
+fn resolve_runtime_and_cleanup(
+    runtime_result: io::Result<i32>,
+    cleanup_result: io::Result<()>,
+) -> io::Result<i32> {
+    match (runtime_result, cleanup_result) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Ok(code), Err(error)) => {
+            eprintln!("failed to remove cgroup: {error}");
+            Ok(code)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(runtime_error), Err(cleanup_error)) => Err(io::Error::other(format!(
+            "{runtime_error}; also failed to remove cgroup: {cleanup_error}"
+        ))),
+    }
 }
 
 fn nix_error_to_io(error: nix::errno::Errno) -> io::Error {
@@ -523,84 +240,8 @@ fn main() {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cli_args_become_runtime_configuration() {
-        let cli = parse_cli([
-            "minictr",
-            "run",
-            "--rootfs",
-            "./rootfs",
-            "--hostname",
-            "testbox",
-            "--init",
-            "--mount",
-            "/host/data:/data",
-            "--",
-            "sh",
-            "-c",
-            "printf hello",
-        ])
-        .unwrap();
-
-        assert_eq!(cli.operation, "run");
-        assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
-        assert_eq!(cli.hostname.as_deref(), Some("testbox"));
-        assert!(cli.init);
-        assert_eq!(
-            cli.bind_mounts,
-            [BindMount {
-                source: PathBuf::from("/host/data"),
-                destination: PathBuf::from("/data"),
-            }]
-        );
-        assert_eq!(cli.command_tokens, ["sh", "-c", "printf hello"]);
-    }
-
-    #[test]
-    fn rootfs_is_parsed_before_the_command_separator() {
-        let cli = parse_cli(["minictr", "run", "--rootfs", "./rootfs", "--", "/bin/sh"]).unwrap();
-
-        assert_eq!(cli.rootfs, PathBuf::from("./rootfs"));
-        assert_eq!(cli.hostname, None);
-        assert!(!cli.init);
-        assert!(cli.bind_mounts.is_empty());
-        assert_eq!(cli.command_tokens, ["/bin/sh"]);
-    }
-
-    #[test]
-    fn bind_mount_parser_requires_an_absolute_container_path() {
-        assert_eq!(
-            parse_bind_mount("/host/data:/data").unwrap(),
-            BindMount {
-                source: PathBuf::from("/host/data"),
-                destination: PathBuf::from("/data"),
-            }
-        );
-        assert!(parse_bind_mount("/host/data:data").is_err());
-        assert!(parse_bind_mount("/host/data").is_err());
-        assert!(parse_bind_mount(":/data").is_err());
-        assert!(parse_bind_mount("/host/data:/../outside").is_err());
-        assert!(parse_bind_mount("/host/data:/").is_err());
-        assert!(parse_bind_mount("/host/data:/oldroot").is_err());
-        assert!(parse_bind_mount("/host/data:/oldroot/nested").is_err());
-        assert!(parse_bind_mount("/host/data:/oldroot-safe").is_ok());
-    }
-
-    #[test]
-    fn hostname_validation_rejects_invalid_values() {
-        assert!(validate_hostname("").is_err());
-        assert!(validate_hostname("has space").is_err());
-        assert!(validate_hostname("-starts-with-dash").is_err());
-        assert!(validate_hostname(&"x".repeat(MAX_HOSTNAME_LEN + 1)).is_err());
-        assert_eq!(
-            validate_hostname("testbox-1.example").unwrap(),
-            "testbox-1.example"
-        );
-    }
 
     #[test]
     fn namespace_configuration_includes_pid_uts_and_mount() {
@@ -612,10 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn mount_tree_is_configured_as_recursively_private() {
-        let flags = private_mount_flags();
+    fn cleanup_failure_does_not_replace_workload_status() {
+        let result =
+            resolve_runtime_and_cleanup(Ok(37), Err(io::Error::other("simulated cleanup failure")));
 
-        assert!(flags.contains(MsFlags::MS_PRIVATE));
-        assert!(flags.contains(MsFlags::MS_REC));
+        assert_eq!(result.ok(), Some(37));
     }
 }
