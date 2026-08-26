@@ -36,6 +36,8 @@ This is mostly a toy project to see how i can build these things/learn some rust
   command as its child, reap adopted descendants, and preserve the user
   command's exit status.
 - Wait for the container's PID 1 process and propagate its exit status.
+- Create a cgroup v2 for each container, enroll the child runtime before it
+  starts the workload, and limit the container to 16 processes by default.
 - Demonstrate host and namespace PID mapping through `/proc/<pid>/status` and
   `NSpid`.
 - Verify that the container's PID 1 process is gone after the runtime exits.
@@ -96,6 +98,6 @@ bind-mount behavior.
 
 ## Roadmap
 
-1. Add cgroup-based resource controls.
+1. Expand cgroup-based resource controls.
 2. Add signal forwarding and shutdown semantics.
 3. Harden cleanup across normal exits and failures.

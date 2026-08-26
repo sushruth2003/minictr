@@ -20,6 +20,7 @@ use std::{
 
 const MAX_HOSTNAME_LEN: usize = 64;
 const OLD_ROOT_PATH: &str = "/oldroot";
+const DEFAULT_PIDS_MAX: &str = "16";
 
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(author, version, about)]
@@ -116,7 +117,12 @@ where
     Ok(cli)
 }
 
-fn init_container(args: &Cli) -> isize {
+fn init_container(args: &Cli, cgroup_path: &Path) -> isize {
+    if let Err(error) = join_cgroup(cgroup_path) {
+        eprintln!("failed to join cgroup: {error}");
+        return 1;
+    }
+
     match run_container(args) {
         Ok(code) => code as isize,
         Err(error) => {
@@ -357,6 +363,75 @@ fn namespace_clone_flags() -> CloneFlags {
     CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS
 }
 
+#[cfg(target_os = "linux")]
+fn create_cgroup() -> io::Result<PathBuf> {
+    let root = Path::new("/sys/fs/cgroup");
+    let controllers = fs::read_to_string(root.join("cgroup.controllers"))?;
+    if !controllers
+        .split_whitespace()
+        .any(|controller| controller == "pids")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroup v2 pids controller is not available",
+        ));
+    }
+
+    let root_subtree_control = root.join("cgroup.subtree_control");
+    let enabled = fs::read_to_string(&root_subtree_control)?;
+    if !enabled
+        .split_whitespace()
+        .any(|controller| controller == "pids")
+    {
+        fs::write(&root_subtree_control, "+pids")?;
+    }
+
+    let parent = root.join("minictr");
+    fs::create_dir_all(&parent)?;
+    let subtree_control = parent.join("cgroup.subtree_control");
+    if subtree_control.exists() {
+        let enabled = fs::read_to_string(&subtree_control)?;
+        if !enabled
+            .split_whitespace()
+            .any(|controller| controller == "pids")
+        {
+            fs::write(&subtree_control, "+pids")?;
+        }
+    }
+    let path = parent.join(format!("runtime-{}", std::process::id()));
+    fs::create_dir(&path)?;
+    if let Err(error) = fs::write(path.join("pids.max"), DEFAULT_PIDS_MAX) {
+        let _ = fs::remove_dir(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_cgroup() -> io::Result<PathBuf> {
+    Ok(PathBuf::new())
+}
+
+#[cfg(target_os = "linux")]
+fn join_cgroup(path: &Path) -> io::Result<()> {
+    fs::write(path.join("cgroup.procs"), std::process::id().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn join_cgroup(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_cgroup(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_cgroup(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[allow(unsafe_code)]
 fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
     let rootfs = fs::canonicalize(&args.rootfs)?;
@@ -382,31 +457,41 @@ fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
 
     let mut stack = vec![0u8; 1024 * 1024];
     let flags = namespace_clone_flags();
+    let cgroup_path = create_cgroup()?;
 
     // SAFETY: the child stack remains alive until the cloned runtime exits,
     // and the callback only captures data owned by this function.
     let runtime_pid = unsafe {
         clone(
-            Box::new(|| init_container(&args)),
+            Box::new(|| init_container(&args, &cgroup_path)),
             &mut stack,
             flags,
             Some(Signal::SIGCHLD as i32),
         )
-    }?;
-    match waitpid(runtime_pid, None)? {
-        WaitStatus::Exited(_, code) => Ok(code),
-        WaitStatus::Signaled(_, signal, _) => {
-            // PID 1 was killed by a signal
-            Ok(128 + signal as i32)
-        }
+    };
+    let runtime_result = match runtime_pid {
+        Ok(runtime_pid) => match waitpid(runtime_pid, None) {
+            Ok(status) => match status {
+                WaitStatus::Exited(_, code) => Ok(code),
+                WaitStatus::Signaled(_, signal, _) => {
+                    // PID 1 was killed by a signal
+                    Ok(128 + signal as i32)
+                }
 
-        other => {
-            // Unexpected for a blocking waitpid with no special flags
-            Err(io::Error::other(format!(
-                "unexpected wait status: {other:?}"
-            )))
-        }
-    }
+                other => {
+                    // Unexpected for a blocking waitpid with no special flags
+                    Err(io::Error::other(format!(
+                        "unexpected wait status: {other:?}"
+                    )))
+                }
+            },
+            Err(error) => Err(io::Error::from(error)),
+        },
+        Err(error) => Err(io::Error::from(error)),
+    };
+
+    remove_cgroup(&cgroup_path)?;
+    runtime_result
 }
 
 fn nix_error_to_io(error: nix::errno::Errno) -> io::Error {

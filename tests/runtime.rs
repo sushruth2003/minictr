@@ -58,6 +58,8 @@ fn create_basic_rootfs(label: &str) -> (PathBuf, PathBuf) {
     let fixture = unique_temp_path(label);
     let rootfs = fixture.join("rootfs");
     fs::create_dir_all(rootfs.join("tmp")).expect("basic rootfs should be created");
+    fs::create_dir_all(rootfs.join("dev")).expect("basic rootfs dev directory should be created");
+    fs::write(rootfs.join("dev/null"), b"").expect("basic rootfs null placeholder should exist");
     for binary in ["/bin/sh", "/bin/hostname", "/bin/sleep"] {
         install_binary_with_dependencies(Path::new(binary), &rootfs);
     }
@@ -256,6 +258,30 @@ fn init_exec_failure_returns_command_not_found_status() {
         String::from_utf8_lossy(&output.stderr).contains("failed to execute command"),
         "stderr was: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn child_cannot_exceed_the_default_pid_limit() {
+    let output = run_runtime(&[
+        "run",
+        "--init",
+        "/bin/sh",
+        "-c",
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do /bin/sleep 1 & done; wait",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "the workload unexpectedly exceeded pids.max"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("can't fork")
+            || stderr.contains("Cannot fork")
+            || stderr.contains("Resource temporarily unavailable"),
+        "the workload forked without hitting pids.max; stderr was: {stderr}"
     );
 }
 
