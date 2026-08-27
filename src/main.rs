@@ -1,12 +1,17 @@
 mod cgroup;
 mod cli;
 mod config;
+mod process;
 mod rootfs;
 
 use crate::{
     cgroup::Cgroup,
     cli::{Cli, parse_cli},
     config::RuntimeConfig,
+    process::{
+        ProcessOutcome, RUNTIME_ERROR_EXIT_CODE, SignalForwarder, exec_failure_exit_code,
+        process_outcome, set_parent_death_signal, wait_for_process,
+    },
     rootfs::{
         make_mount_tree_private, make_rootfs_mount_point, mount_bind, mount_procfs,
         pivot_into_rootfs,
@@ -17,32 +22,38 @@ use nix::{
     libc,
     sched::{CloneFlags, clone},
     sys::{
-        signal::Signal,
-        wait::{WaitStatus, waitpid},
+        signal::{Signal, kill},
+        wait::waitpid,
     },
-    unistd::{ForkResult, Pid, fork, gethostname, sethostname},
+    unistd::{ForkResult, Pid, fork, gethostname, sethostname, setpgid},
 };
 use std::{fs, io, os::unix::process::CommandExt, process::Command};
 
-fn init_container(args: &Cli, cgroup: Option<&Cgroup>) -> isize {
-    if let Some(cgroup) = cgroup
-        && let Err(error) = cgroup.join_current()
-    {
-        eprintln!("failed to join cgroup: {error}");
-        return 1;
-    }
-
-    match run_container(args) {
+fn init_container(args: &Cli, cgroup: Option<&Cgroup>, signals: &SignalForwarder) -> isize {
+    match run_container(args, cgroup, signals) {
         Ok(code) => code as isize,
         Err(error) => {
             eprintln!("{error}");
-            1
+            RUNTIME_ERROR_EXIT_CODE as isize
         }
     }
 }
 
 #[allow(unsafe_code)]
-fn run_container(args: &Cli) -> Result<i32, String> {
+fn run_container(
+    args: &Cli,
+    cgroup: Option<&Cgroup>,
+    signals: &SignalForwarder,
+) -> Result<i32, String> {
+    set_parent_death_signal()
+        .map_err(|error| format!("failed to configure parent-death signal: {error}"))?;
+
+    if let Some(cgroup) = cgroup {
+        cgroup
+            .join_current()
+            .map_err(|error| format!("failed to join cgroup: {error}"))?;
+    }
+
     if let Err(error) = make_mount_tree_private() {
         return Err(format!("failed to make mount tree private: {error}"));
     }
@@ -85,43 +96,71 @@ fn run_container(args: &Cli) -> Result<i32, String> {
     if args.init {
         let workload_pid = match unsafe { fork() } {
             Ok(ForkResult::Child) => {
+                if let Err(error) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+                    eprintln!("failed to create workload process group: {error}");
+                    // SAFETY: this is the post-fork workload child.
+                    unsafe { libc::_exit(RUNTIME_ERROR_EXIT_CODE) };
+                }
+                if let Err(error) = signals.restore() {
+                    eprintln!("failed to restore workload signal state: {error}");
+                    // SAFETY: this is the post-fork workload child.
+                    unsafe { libc::_exit(RUNTIME_ERROR_EXIT_CODE) };
+                }
                 eprintln!("inside child: {}", std::process::id());
                 let error = exec_command(&args.command_tokens);
                 eprintln!("failed to execute command: {error}");
                 // SAFETY: exec failed in the post-fork child, so terminate
                 // immediately without running cleanup inherited from PID 1.
-                unsafe { libc::_exit(127) };
+                unsafe { libc::_exit(exec_failure_exit_code(&error)) };
             }
             Ok(ForkResult::Parent { child }) => child,
             Err(error) => {
                 return Err(format!("failed to fork workload: {error}"));
             }
         };
+        match setpgid(workload_pid, workload_pid) {
+            Ok(()) | Err(Errno::EACCES) | Err(Errno::ESRCH) => {}
+            Err(error) => {
+                let _ = kill(workload_pid, Signal::SIGKILL);
+                let _ = waitpid(workload_pid, None);
+                return Err(format!("failed to create workload process group: {error}"));
+            }
+        }
+        if let Err(error) = signals.activate_process_group(workload_pid) {
+            let _ = kill(workload_pid, Signal::SIGKILL);
+            let _ = waitpid(workload_pid, None);
+            return Err(format!("failed to activate signal forwarding: {error}"));
+        }
         let mut workload_status = None;
 
         Ok(loop {
             match waitpid(Pid::from_raw(-1), None) {
-                Ok(WaitStatus::Exited(pid, code)) if pid == workload_pid => {
-                    workload_status = Some(code);
+                Ok(status) => {
+                    if let Some(outcome) = process_outcome(status, workload_pid)
+                        .map_err(|error| format!("failed to interpret workload status: {error}"))?
+                    {
+                        workload_status = Some(outcome.exit_code());
+                    }
                 }
-                Ok(WaitStatus::Signaled(pid, signal, _)) if pid == workload_pid => {
-                    workload_status = Some(128 + signal as i32);
-                }
-                Ok(_) => {}
                 Err(Errno::EINTR) => continue,
-                Err(Errno::ECHILD) => break workload_status.unwrap_or(1),
+                Err(Errno::ECHILD) => {
+                    signals.clear_target();
+                    break workload_status.unwrap_or(RUNTIME_ERROR_EXIT_CODE);
+                }
                 Err(error) => {
                     eprintln!("failed to wait for workload: {error}");
-                    break 1;
+                    break RUNTIME_ERROR_EXIT_CODE;
                 }
             }
         })
     } else {
+        signals
+            .restore()
+            .map_err(|error| format!("failed to restore workload signal state: {error}"))?;
         eprintln!("inside child: {}", std::process::id());
-        Err(format!(
-            "failed to execute command: {}",
-            exec_command(&args.command_tokens)
-        ))
+        let error = exec_command(&args.command_tokens);
+        eprintln!("failed to execute command: {error}");
+        Ok(exec_failure_exit_code(&error))
     }
 }
 
@@ -130,7 +169,7 @@ fn namespace_clone_flags() -> CloneFlags {
 }
 
 #[allow(unsafe_code)]
-fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
+fn initialize_namespaced_runtime(args: Cli) -> io::Result<ProcessOutcome> {
     let runtime_config = RuntimeConfig::load(args.config.as_deref())?;
     let rootfs = fs::canonicalize(&args.rootfs)?;
     if !rootfs.is_dir() {
@@ -155,49 +194,45 @@ fn initialize_namespaced_runtime(args: Cli) -> io::Result<i32> {
 
     let mut stack = vec![0u8; 1024 * 1024];
     let flags = namespace_clone_flags();
+    let signals = SignalForwarder::install()?;
     let cgroup = Cgroup::create(&runtime_config.resources)?;
 
     // SAFETY: the child stack remains alive until the cloned runtime exits,
     // and the callback only captures data owned by this function.
     let runtime_pid = unsafe {
         clone(
-            Box::new(|| init_container(&args, cgroup.as_ref())),
+            Box::new(|| init_container(&args, cgroup.as_ref(), &signals)),
             &mut stack,
             flags,
             Some(Signal::SIGCHLD as i32),
         )
     };
-    let runtime_result = runtime_pid
-        .map_err(io::Error::from)
-        .and_then(wait_for_runtime);
+    let runtime_result = match runtime_pid {
+        Ok(runtime_pid) => match signals.activate_process(runtime_pid) {
+            Ok(()) => wait_for_process(runtime_pid),
+            Err(error) => {
+                let _ = kill(runtime_pid, Signal::SIGKILL);
+                let _ = wait_for_process(runtime_pid);
+                Err(error)
+            }
+        },
+        Err(error) => Err(io::Error::from(error)),
+    };
 
     let cleanup_result = match cgroup {
         Some(cgroup) => cgroup.remove(),
         None => Ok(()),
     };
+    if let Err(error) = signals.restore() {
+        eprintln!("failed to restore host signal state: {error}");
+    }
     resolve_runtime_and_cleanup(runtime_result, cleanup_result)
 }
 
-fn wait_for_runtime(runtime_pid: Pid) -> io::Result<i32> {
-    loop {
-        match waitpid(runtime_pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-            Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
-            Ok(other) => {
-                return Err(io::Error::other(format!(
-                    "unexpected wait status: {other:?}"
-                )));
-            }
-            Err(Errno::EINTR) => continue,
-            Err(error) => return Err(io::Error::from(error)),
-        }
-    }
-}
-
 fn resolve_runtime_and_cleanup(
-    runtime_result: io::Result<i32>,
+    runtime_result: io::Result<ProcessOutcome>,
     cleanup_result: io::Result<()>,
-) -> io::Result<i32> {
+) -> io::Result<ProcessOutcome> {
     match (runtime_result, cleanup_result) {
         (Ok(code), Ok(())) => Ok(code),
         (Ok(code), Err(error)) => {
@@ -229,12 +264,12 @@ fn main() {
     };
 
     match initialize_namespaced_runtime(args) {
-        Ok(code) => {
-            std::process::exit(code);
+        Ok(outcome) => {
+            std::process::exit(outcome.exit_code());
         }
         Err(error) => {
             eprintln!("error: {error}");
-            std::process::exit(1);
+            std::process::exit(RUNTIME_ERROR_EXIT_CODE);
         }
     }
 }
@@ -254,9 +289,11 @@ mod tests {
 
     #[test]
     fn cleanup_failure_does_not_replace_workload_status() {
-        let result =
-            resolve_runtime_and_cleanup(Ok(37), Err(io::Error::other("simulated cleanup failure")));
+        let result = resolve_runtime_and_cleanup(
+            Ok(ProcessOutcome::Exited(37)),
+            Err(io::Error::other("simulated cleanup failure")),
+        );
 
-        assert_eq!(result.ok(), Some(37));
+        assert_eq!(result.ok(), Some(ProcessOutcome::Exited(37)));
     }
 }

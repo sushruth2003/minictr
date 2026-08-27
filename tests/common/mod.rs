@@ -39,8 +39,8 @@ pub(crate) fn assert_success(output: &Output) {
     );
 }
 
-pub(crate) fn assert_exec_failure(output: &Output, start: Instant) {
-    assert_eq!(output.status.code(), Some(1));
+pub(crate) fn assert_exec_failure(output: &Output, start: Instant, expected_code: i32) {
+    assert_eq!(output.status.code(), Some(expected_code));
     assert!(start.elapsed() < Duration::from_secs(2));
 }
 

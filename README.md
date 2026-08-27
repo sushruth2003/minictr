@@ -14,6 +14,8 @@ useful as a systems-programming learning project.
 - An optional `--init` shim that reaps adopted descendants
 - Optional cgroup v2 PID limits loaded from a JSON resource configuration
 - Workload exit-status propagation
+- Forwarding of `SIGHUP`, `SIGINT`, `SIGQUIT`, and `SIGTERM` through the host
+  supervisor and optional init shim
 
 Namespaces control what the workload can see. Cgroups control how much the
 workload and all of its descendants can consume.
@@ -55,8 +57,17 @@ sudo ./target/release/minictr run \
 ```
 
 The shim remains PID 1, runs the workload as PID 2, reaps adopted descendants,
-and returns the workload's exit status after every descendant has exited.
-Signal forwarding is planned for a later milestone.
+forwards termination signals to the workload process group, and returns the
+workload's exit status after every descendant has exited.
+
+Without `--init`, the workload remains namespace PID 1 and therefore owns PID
+1's special Linux signal semantics. Use `--init` when predictable signal
+forwarding and descendant reaping are required.
+
+`minictr` uses conventional container CLI status codes: `125` for a runtime or
+container-setup failure, `126` when a command exists but cannot be executed,
+and `127` when the command cannot be found. A workload's own exit status is
+otherwise preserved; signal deaths are represented as `128 + signal`.
 
 ### Bind mounts
 
@@ -119,14 +130,16 @@ host minictr
   │    ├── join the cgroup
   │    ├── prepare mounts, rootfs, /proc, and hostname
   │    └── exec the workload directly, or fork it under --init
-  ├── wait for namespace PID 1
+  ├── forward catchable termination signals and wait for namespace PID 1
   ├── remove the per-container cgroup
   └── return the workload status
 ```
 
 The implementation is split by responsibility:
 
-- `src/main.rs`: namespace process lifecycle and top-level orchestration
+- `src/main.rs`: namespace setup and top-level orchestration
+- `src/process.rs`: signal forwarding, child outcomes, parent-death behavior,
+  and runtime/exec status conventions
 - `src/cli.rs`: command-line parsing and validation
 - `src/config.rs`: strict JSON parsing and resource-policy validation
 - `src/cgroup.rs`: cgroup creation, controller configuration, membership, and
@@ -145,10 +158,11 @@ root:
 The suite covers CLI/config validation, command and stream preservation,
 exit-status propagation, UTS/PID/mount isolation, rootfs and `/proc` isolation,
 bind mounts, init topology and orphan reaping, PID-limit enforcement, no-config
-compatibility, and cgroup cleanup.
+compatibility, signal propagation, and cgroup cleanup.
 
 ## Roadmap
 
 1. Complete M5 with memory and CPU cgroup v2 controls plus lifecycle hardening.
-2. Add signal forwarding and shutdown semantics.
-3. Harden cleanup across normal exits and failures.
+2. Add configurable shutdown timeouts and escalation policy.
+3. Add structured host/PID-1 error reporting and recovery of stale cgroups
+   after an uncatchable host failure such as `SIGKILL`.

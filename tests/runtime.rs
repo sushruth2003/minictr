@@ -62,14 +62,15 @@ fn nonexistent_executable_fails_quickly_without_reporting_a_child() {
         "/definitely/not/a/minictr-test-executable",
     ]);
 
-    assert_exec_failure(&output, start);
+    assert_exec_failure(&output, start, 127);
 }
 
 #[test]
 fn non_executable_child_file_fails_during_exec() {
     use std::os::unix::fs::PermissionsExt;
 
-    let path = std::env::temp_dir().join(format!("minictr-non-executable-{}", std::process::id()));
+    let (fixture, rootfs) = create_basic_rootfs("non-executable");
+    let path = rootfs.join("non-executable");
     fs::write(&path, b"#!/bin/sh\nprintf should-not-run\n").expect("test file should be writable");
     let mut permissions = fs::metadata(&path)
         .expect("test file should exist")
@@ -77,12 +78,16 @@ fn non_executable_child_file_fails_during_exec() {
     permissions.set_mode(0o644);
     fs::set_permissions(&path, permissions).expect("test file permissions should be set");
 
-    let path_string = path.to_string_lossy().into_owned();
     let start = Instant::now();
-    let output = run_runtime(&["run", "--hostname", "testbox", &path_string]);
-    let _ = fs::remove_file(&path);
+    let output = Command::new(env!("CARGO_BIN_EXE_minictr"))
+        .args(["run", "--rootfs"])
+        .arg(&rootfs)
+        .args(["--hostname", "testbox", "/non-executable"])
+        .output()
+        .expect("runtime should execute against the fixture rootfs");
+    fs::remove_dir_all(fixture).expect("non-executable fixture should be removed");
 
-    assert_exec_failure(&output, start);
+    assert_exec_failure(&output, start, 126);
 }
 
 #[test]
@@ -161,6 +166,13 @@ fn init_flag_preserves_workload_exit_status() {
     let output = run_runtime(&["run", "--init", "/bin/sh", "-c", "sleep 1 & exit 37"]);
 
     assert_eq!(output.status.code(), Some(37));
+}
+
+#[test]
+fn init_flag_converts_workload_signal_to_shell_status() {
+    let output = run_runtime(&["run", "--init", "/bin/sh", "-c", "kill -TERM $$"]);
+
+    assert_eq!(output.status.code(), Some(143));
 }
 
 #[test]
